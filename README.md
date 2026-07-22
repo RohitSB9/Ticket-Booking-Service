@@ -12,9 +12,9 @@ concurrent load. Built to mirror real-world booking systems (e.g. Ticketmaster).
                  └─────────────────┘
                           │
                           ▼
-                 ┌─────────────────┐        Redis (seat locks, TTL) — step 3
+                 ┌─────────────────┐        Redis (seat locks, TTL)
    React SPA ──▶ │ Reservation Svc  │ ─────▶ SETNX seat:{id} -> userId
-                 └─────────────────┘         (this step: no lock yet)
+                 └─────────────────┘
                           │ publishes SeatReserved
                           ▼
                  ┌─────────────────┐
@@ -31,7 +31,7 @@ concurrent load. Built to mirror real-world booking systems (e.g. Ticketmaster).
 
 - [x] Step 1: Event Service (this repo) — CRUD for events/seats, Postgres-backed
 - [x] Step 2: Wire Reservation Service to Event Service, no locking yet
-- [ ] Step 3: Add Redis distributed locking to Reservation Service
+- [x] Step 3: Add Redis distributed locking to Reservation Service
 - [ ] Step 4: Add Kafka + Payment Service
 - [ ] Step 5: Expiry sweep for abandoned reservations
 - [ ] Step 6: Load test proving no double-booking under concurrency
@@ -41,13 +41,13 @@ concurrent load. Built to mirror real-world booking systems (e.g. Ticketmaster).
 
 Owns event and seat inventory. Seats are generated automatically when an event
 is created (`rows` x `seatsPerRow`), labeled like `A1`, `A2`, ... `B1`, `B2`.
-Every seat starts as `AVAILABLE`. The Reservation Service (step 2+) will call
-into this service to read seat state and will own the actual reserve/release
-transitions once Redis locking is introduced.
+Every seat starts as `AVAILABLE`. The Reservation Service reads seat state
+from here and owns the actual reserve/release transitions, serialized by its
+own Redis lock (step 3).
 
 A `@Version` field on `Seat` gives an optimistic-lock backstop at the DB layer,
-independent of the Redis lock the Reservation Service will use — worth
-mentioning in interviews as defense-in-depth against lost updates.
+independent of the Redis lock the Reservation Service uses — worth mentioning
+in interviews as defense-in-depth against lost updates.
 
 ### Endpoints
 
@@ -61,10 +61,8 @@ mentioning in interviews as defense-in-depth against lost updates.
 | PATCH  | `/api/events/{eventId}/seats/{seatId}`        | Set a seat's status (used by Reservation Service) |
 
 The PATCH endpoint does no transition validation — it writes whatever status
-it's given. That's intentional: in step 2 the Reservation Service does a
-check-then-act against this endpoint with nothing in between, so double
-bookings are possible under concurrent load. Step 3 fixes this with a Redis
-lock in the Reservation Service, not with validation here.
+it's given. Event Service stays a dumb data store on purpose: concurrency
+safety lives in the Reservation Service's Redis lock (step 3), not here.
 
 Swagger UI: `http://localhost:8081/swagger-ui.html`
 
@@ -87,8 +85,41 @@ curl -X POST http://localhost:8081/api/events \
 Owns the reservation lifecycle. On create, it calls Event Service to check
 the seat is `AVAILABLE`, writes its own `PENDING` reservation row, then calls
 Event Service to flip the seat to `RESERVED`. On cancel, it flips the seat
-back to `AVAILABLE`. No locking sits between the check and the write yet —
-that's step 3.
+back to `AVAILABLE`. Both operations run inside a per-seat Redis lock.
+
+### Locking
+
+Every create/cancel is wrapped in a distributed lock keyed by seat:
+
+```
+SETNX seat:{seatId} -> userId   EX 5s
+... check availability, write reservation, call Event Service ...
+DEL seat:{seatId}               (only if the value still matches — Lua script)
+```
+
+- **`SETNX`** (`SET ... NX`) makes acquisition atomic — exactly one concurrent
+  caller gets the lock; everyone else gets `false` back immediately and the
+  request fails fast with `409 Conflict`, no blocking/retrying.
+- **5s TTL** is a crash safety net: if the process dies mid-reservation, the
+  lock expires on its own instead of wedging the seat forever.
+- **Compare-and-delete unlock** (a small Lua script run atomically) means a
+  caller can only release a lock it still owns — without it, a caller whose
+  TTL already expired could delete a different caller's lock out from under
+  it after that key gets reacquired.
+
+This is what actually closes the race step 2 left open: two requests for the
+same seat now serialize on this lock instead of both racing Event Service's
+check-then-act. `ReservationControllerIntegrationTest` proves it directly —
+`createReservation_secondConcurrentAttemptForSameSeatIsRejected` fires two
+concurrent reservation attempts for the same seat against a real Redis
+(Testcontainers) and asserts exactly one wins.
+
+You can watch a lock exist mid-request with `redis-cli`:
+```bash
+docker exec -it ticketing-redis redis-cli
+> GET seat:<seat-id>          # shows the owning userId while a request is in flight
+> TTL seat:<seat-id>          # counts down from 5
+```
 
 ### Endpoints
 
@@ -118,7 +149,7 @@ curl -X POST http://localhost:8082/api/reservations \
 Requires Java 21, Maven, and Docker.
 
 ```bash
-# 1. Start Postgres
+# 1. Start Postgres + Redis
 docker compose up -d
 
 # 2. Run Event Service (port 8081)
@@ -132,15 +163,23 @@ cd reservation-service
 
 Reservation Service reads `event-service.base-url` (defaults to
 `http://localhost:8081`) to talk to Event Service, so Event Service needs to
-be up first.
+be up first. It also needs Redis reachable at `spring.data.redis.host`/`port`
+(default `localhost:6379`).
+
+Postgres is published on host port **5433**, not 5432 — set that way in
+`docker-compose.yml` to avoid colliding with a native Postgres install. If
+`docker compose up -d` and the app still can't connect, check for a port
+conflict the same way (`netstat`/`lsof` on the port in question) before
+assuming it's a code problem.
 
 ## Testing
 
-Integration tests spin up a real Postgres instance via Testcontainers — no
-mocking of the database layer, so tests exercise actual SQL and constraints.
+Integration tests spin up real Postgres (and, for Reservation Service, Redis)
+instances via Testcontainers — no mocking of the database or lock layer, so
+tests exercise actual SQL, constraints, and `SETNX`/TTL/unlock semantics.
 Reservation Service's tests mock `EventServiceClient` instead of running
 Event Service, since only the HTTP boundary is faked — reservation
-persistence and orchestration logic still run for real.
+persistence, locking, and orchestration logic still run for real.
 
 ```bash
 cd event-service

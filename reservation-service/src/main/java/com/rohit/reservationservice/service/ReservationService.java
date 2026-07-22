@@ -5,7 +5,9 @@ import com.rohit.reservationservice.dto.CreateReservationRequest;
 import com.rohit.reservationservice.dto.ReservationResponse;
 import com.rohit.reservationservice.dto.SeatDto;
 import com.rohit.reservationservice.exception.ResourceNotFoundException;
+import com.rohit.reservationservice.exception.SeatLockedException;
 import com.rohit.reservationservice.exception.SeatUnavailableException;
+import com.rohit.reservationservice.lock.SeatLockService;
 import com.rohit.reservationservice.model.Reservation;
 import com.rohit.reservationservice.model.ReservationStatus;
 import com.rohit.reservationservice.model.SeatStatus;
@@ -24,29 +26,38 @@ public class ReservationService {
 
     private final ReservationRepository reservationRepository;
     private final EventServiceClient eventServiceClient;
+    private final SeatLockService seatLockService;
 
-    // Check-then-act against Event Service with no lock in between: two
-    // concurrent requests for the same seat can both pass the availability
-    // check and both succeed here. That race is intentional for step 2 —
-    // step 3 closes it with a Redis lock around this method.
+    // The Redis lock wraps the whole check-then-act against Event Service:
+    // a concurrent request for the same seat now fails fast with
+    // SeatLockedException instead of racing this one between the
+    // availability check and the status update. Step 2 left this race open
+    // on purpose; this closes it.
     @Transactional
     public ReservationResponse createReservation(CreateReservationRequest request) {
-        SeatDto seat = eventServiceClient.getSeat(request.eventId(), request.seatId());
-        if (seat.status() != SeatStatus.AVAILABLE) {
-            throw new SeatUnavailableException("Seat " + seat.seatLabel() + " is not available");
+        if (!seatLockService.tryLock(request.seatId(), request.userId())) {
+            throw new SeatLockedException("Seat " + request.seatId() + " is currently being reserved by another request");
         }
+        try {
+            SeatDto seat = eventServiceClient.getSeat(request.eventId(), request.seatId());
+            if (seat.status() != SeatStatus.AVAILABLE) {
+                throw new SeatUnavailableException("Seat " + seat.seatLabel() + " is not available");
+            }
 
-        Reservation reservation = Reservation.builder()
-                .eventId(request.eventId())
-                .seatId(request.seatId())
-                .userId(request.userId())
-                .status(ReservationStatus.PENDING)
-                .build();
-        Reservation saved = reservationRepository.save(reservation);
+            Reservation reservation = Reservation.builder()
+                    .eventId(request.eventId())
+                    .seatId(request.seatId())
+                    .userId(request.userId())
+                    .status(ReservationStatus.PENDING)
+                    .build();
+            Reservation saved = reservationRepository.save(reservation);
 
-        eventServiceClient.updateSeatStatus(request.eventId(), request.seatId(), SeatStatus.RESERVED);
+            eventServiceClient.updateSeatStatus(request.eventId(), request.seatId(), SeatStatus.RESERVED);
 
-        return ReservationResponse.from(saved);
+            return ReservationResponse.from(saved);
+        } finally {
+            seatLockService.unlock(request.seatId(), request.userId());
+        }
     }
 
     @Transactional(readOnly = true)
@@ -70,11 +81,18 @@ public class ReservationService {
         Reservation reservation = reservationRepository.findById(reservationId)
                 .orElseThrow(() -> new ResourceNotFoundException("Reservation not found: " + reservationId));
 
-        reservation.setStatus(ReservationStatus.CANCELLED);
-        Reservation saved = reservationRepository.save(reservation);
+        if (!seatLockService.tryLock(reservation.getSeatId(), reservation.getUserId())) {
+            throw new SeatLockedException("Seat " + reservation.getSeatId() + " is currently being reserved by another request");
+        }
+        try {
+            reservation.setStatus(ReservationStatus.CANCELLED);
+            Reservation saved = reservationRepository.save(reservation);
 
-        eventServiceClient.updateSeatStatus(reservation.getEventId(), reservation.getSeatId(), SeatStatus.AVAILABLE);
+            eventServiceClient.updateSeatStatus(reservation.getEventId(), reservation.getSeatId(), SeatStatus.AVAILABLE);
 
-        return ReservationResponse.from(saved);
+            return ReservationResponse.from(saved);
+        } finally {
+            seatLockService.unlock(reservation.getSeatId(), reservation.getUserId());
+        }
     }
 }

@@ -24,6 +24,11 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(HttpStatus.CONFLICT).body(body(HttpStatus.CONFLICT, ex.getMessage()));
     }
 
+    @ExceptionHandler(SeatLockedException.class)
+    public ResponseEntity<Map<String, Object>> handleSeatLocked(SeatLockedException ex) {
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(body(HttpStatus.CONFLICT, ex.getMessage()));
+    }
+
     @ExceptionHandler(RestClientException.class)
     public ResponseEntity<Map<String, Object>> handleEventServiceUnavailable(RestClientException ex) {
         return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
