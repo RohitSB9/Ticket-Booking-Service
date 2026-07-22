@@ -1,0 +1,8 @@
+# Overridden at runtime by Testcontainers-provided JDBC properties.
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+
+event-service:
+  base-url: http://localhost:8081
