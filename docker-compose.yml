@@ -1,0 +1,27 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ticketing-postgres
+    environment:
+      POSTGRES_DB: ticketing
+      POSTGRES_USER: ticketing_user
+      POSTGRES_PASSWORD: ticketing_pass
+    ports:
+      # Host port 5433: a pre-existing native Postgres service on this
+      # machine already occupies 5432.
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ticketing_user -d ticketing"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Redis and Kafka/Redpanda get added here in step 3 and step 4
+  # of the build plan, once the Reservation and Payment services exist.
+
+volumes:
+  pgdata:
