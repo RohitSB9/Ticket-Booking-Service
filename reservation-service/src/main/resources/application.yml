@@ -16,6 +16,27 @@ spring:
     redis:
       host: localhost
       port: 6379
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        spring.json.type.mapping: seatReserved:com.rohit.reservationservice.event.SeatReservedEvent
+    consumer:
+      group-id: reservation-service
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: com.rohit.reservationservice.event
+        # Tokens (left side) are the cross-service wire vocabulary; each
+        # service maps them to its own local event class. Payment Service
+        # writes these same tokens when it produces, so the FQCNs on each
+        # side don't need to match, only the tokens do.
+        spring.json.type.mapping: >-
+          paymentConfirmed:com.rohit.reservationservice.event.PaymentConfirmedEvent,
+          paymentFailed:com.rohit.reservationservice.event.PaymentFailedEvent
 
 server:
   port: 8082

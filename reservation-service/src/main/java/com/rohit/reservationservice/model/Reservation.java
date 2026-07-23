@@ -45,6 +45,11 @@ public class Reservation {
     @Builder.Default
     private Instant updatedAt = Instant.now();
 
+    // Set when a payment-failed event or a user cancel puts the reservation
+    // into CANCELLED; null otherwise.
+    @Column(name = "failure_reason")
+    private String failureReason;
+
     @PreUpdate
     void onUpdate() {
         updatedAt = Instant.now();

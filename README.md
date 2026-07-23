@@ -18,11 +18,11 @@ concurrent load. Built to mirror real-world booking systems (e.g. Ticketmaster).
                           │ publishes SeatReserved
                           ▼
                  ┌─────────────────┐
-                 │   Kafka broker   │
+                 │ Redpanda (Kafka) │
                  └─────────────────┘
                           │ consumes SeatReserved
                           ▼
-                 ┌─────────────────┐        Stripe test mode
+                 ┌─────────────────┐        simulated gateway
                  │  Payment Service │ ─────▶ publishes PaymentConfirmed /
                  └─────────────────┘         PaymentFailed
 ```
@@ -32,7 +32,7 @@ concurrent load. Built to mirror real-world booking systems (e.g. Ticketmaster).
 - [x] Step 1: Event Service (this repo) — CRUD for events/seats, Postgres-backed
 - [x] Step 2: Wire Reservation Service to Event Service, no locking yet
 - [x] Step 3: Add Redis distributed locking to Reservation Service
-- [ ] Step 4: Add Kafka + Payment Service
+- [x] Step 4: Add Kafka + Payment Service
 - [ ] Step 5: Expiry sweep for abandoned reservations
 - [ ] Step 6: Load test proving no double-booking under concurrency
 - [ ] Step 7: Dockerize, deploy, write architecture doc
@@ -84,8 +84,17 @@ curl -X POST http://localhost:8081/api/events \
 
 Owns the reservation lifecycle. On create, it calls Event Service to check
 the seat is `AVAILABLE`, writes its own `PENDING` reservation row, then calls
-Event Service to flip the seat to `RESERVED`. On cancel, it flips the seat
-back to `AVAILABLE`. Both operations run inside a per-seat Redis lock.
+Event Service to flip the seat to `RESERVED`, then publishes a
+`seat-reserved` Kafka event. Both create and cancel run inside a per-seat
+Redis lock.
+
+It also consumes `payment-confirmed`/`payment-failed` from Payment Service:
+a confirmed payment moves the reservation to `CONFIRMED` and the seat to
+`SOLD`; a failed one moves the reservation to `CANCELLED` (with the failure
+reason recorded) and releases the seat back to `AVAILABLE`. Both consumers
+are idempotent — Kafka is at-least-once delivery, so a redelivered event for
+a reservation that's already past `PENDING` is treated as a no-op, not an
+error.
 
 ### Locking
 
@@ -144,12 +153,67 @@ curl -X POST http://localhost:8082/api/reservations \
   }'
 ```
 
+## Payment Service — what it does
+
+Fully event-driven — no REST calls in or out to the other services, only
+Kafka. It consumes `seat-reserved`, "processes" the payment, persists a
+`Payment` row, and publishes `payment-confirmed` or `payment-failed`.
+Processing is idempotent: a unique constraint on `reservation_id` means a
+redelivered `seat-reserved` event for an already-processed reservation is a
+no-op, not a duplicate charge.
+
+Payments are **simulated**, not real Stripe calls — deliberately, to keep
+the demo self-contained with no external credentials. The fake gateway
+(`PaymentSimulator`) sits behind one narrow method (`process(userId)` →
+confirmed/failed) specifically so it could be swapped for a real Stripe
+`PaymentIntent` call later without touching the Kafka plumbing around it.
+Since there's no real card data to fail on, the failure path is triggered
+deterministically: any `userId` starting with `fail-` gets a simulated
+decline. Everything else confirms.
+
+### Endpoints
+
+| Method | Path                            | Description                        |
+|--------|----------------------------------|-------------------------------------|
+| GET    | `/api/payments`                 | List all payments                  |
+| GET    | `/api/payments/{reservationId}` | Get the payment for a reservation  |
+
+Swagger UI: `http://localhost:8083/swagger-ui.html`
+
+### Try the failure path
+
+```bash
+curl -X POST http://localhost:8082/api/reservations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "eventId": "<event-id>",
+    "seatId": "<seat-id>",
+    "userId": "fail-user-1"
+  }'
+
+# a couple seconds later, once Payment Service has processed the event:
+curl http://localhost:8082/api/reservations/<reservation-id>
+# → status CANCELLED, failureReason "Card declined (simulated)", seat back to AVAILABLE
+```
+
+### Cross-service event contracts
+
+Each service that touches Kafka has its own copy of the event records
+(`SeatReservedEvent`, `PaymentConfirmedEvent`, `PaymentFailedEvent`) in its
+own package — no shared library, matching how `SeatDto`/`SeatStatus` are
+already duplicated between Event Service and Reservation Service. Messages
+carry a short type token (`seatReserved`, `paymentConfirmed`,
+`paymentFailed`) in the `__TypeId__` header instead of a fully-qualified
+class name, via `spring.json.type.mapping` in each service's
+`application.yml` — that's what lets two different classes in two different
+packages deserialize the same message correctly.
+
 ## Running locally
 
 Requires Java 21, Maven, and Docker.
 
 ```bash
-# 1. Start Postgres + Redis
+# 1. Start Postgres + Redis + Redpanda
 docker compose up -d
 
 # 2. Run Event Service (port 8081)
@@ -159,12 +223,20 @@ cd event-service
 # 3. In another terminal, run Reservation Service (port 8082)
 cd reservation-service
 ./mvnw spring-boot:run
+
+# 4. In another terminal, run Payment Service (port 8083)
+cd payment-service
+./mvnw spring-boot:run
 ```
 
 Reservation Service reads `event-service.base-url` (defaults to
 `http://localhost:8081`) to talk to Event Service, so Event Service needs to
-be up first. It also needs Redis reachable at `spring.data.redis.host`/`port`
-(default `localhost:6379`).
+be up first. Reservation Service also needs Redis
+(`spring.data.redis.host`/`port`, default `localhost:6379`) for its seat
+lock. Both Reservation Service and Payment Service need Redpanda reachable
+at `spring.kafka.bootstrap-servers` (default `localhost:9092`); it
+auto-creates the `seat-reserved`/`payment-confirmed`/`payment-failed` topics
+on first use, no manual provisioning needed.
 
 Postgres is published on host port **5433**, not 5432 — set that way in
 `docker-compose.yml` to avoid colliding with a native Postgres install. If
@@ -174,18 +246,23 @@ assuming it's a code problem.
 
 ## Testing
 
-Integration tests spin up real Postgres (and, for Reservation Service, Redis)
-instances via Testcontainers — no mocking of the database or lock layer, so
-tests exercise actual SQL, constraints, and `SETNX`/TTL/unlock semantics.
-Reservation Service's tests mock `EventServiceClient` instead of running
-Event Service, since only the HTTP boundary is faked — reservation
-persistence, locking, and orchestration logic still run for real.
+Integration tests spin up real Postgres, Redis, and Kafka (Testcontainers) —
+no mocking of the database, lock, or messaging layer, so tests exercise
+actual SQL, `SETNX`/TTL/unlock semantics, and real produce/consume round
+trips. The only thing ever mocked is Reservation Service's REST call to
+Event Service (`EventServiceClient`); Payment Service has no REST
+dependency on either other service at all — it's reached only through Kafka,
+which is real in its tests too. Async consumer tests poll the row a listener
+writes (or the REST endpoint backed by it) instead of sleeping a fixed guess.
 
 ```bash
 cd event-service
 ./mvnw test
 
 cd reservation-service
+./mvnw test
+
+cd payment-service
 ./mvnw test
 ```
 

@@ -12,6 +12,7 @@ public record ReservationResponse(
         UUID seatId,
         String userId,
         ReservationStatus status,
+        String failureReason,
         Instant createdAt
 ) {
     public static ReservationResponse from(Reservation reservation) {
@@ -21,6 +22,7 @@ public record ReservationResponse(
                 reservation.getSeatId(),
                 reservation.getUserId(),
                 reservation.getStatus(),
+                reservation.getFailureReason(),
                 reservation.getCreatedAt()
         );
     }
