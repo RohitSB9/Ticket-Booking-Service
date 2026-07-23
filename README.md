@@ -4,6 +4,11 @@ A microservices-based ticket booking platform demonstrating distributed locking,
 event-driven service communication (Kafka), and race-condition handling under
 concurrent load. Built to mirror real-world booking systems (e.g. Ticketmaster).
 
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the design reasoning — service
+boundaries, the concurrency story end to end, failure handling, and known
+limitations. This README is the "what" and "how to run it"; that doc is the
+"why."
+
 ## Architecture (target end state)
 
 ```
@@ -35,7 +40,7 @@ concurrent load. Built to mirror real-world booking systems (e.g. Ticketmaster).
 - [x] Step 4: Add Kafka + Payment Service
 - [x] Step 5: Expiry sweep for abandoned reservations
 - [x] Step 6: Load test proving no double-booking under concurrency
-- [ ] Step 7: Dockerize, deploy, write architecture doc
+- [x] Step 7: Dockerize, write architecture doc ("deploy" scoped down to full local containerization — see [ARCHITECTURE.md](ARCHITECTURE.md#deployment))
 
 ## Event Service — what it does
 
@@ -251,11 +256,31 @@ packages deserialize the same message correctly.
 
 ## Running locally
 
-Requires Java 21, Maven, and Docker.
+Requires Java 21, Maven, and Docker. Two ways to run it — pick one.
+
+### Option A: everything in Docker
+
+```bash
+docker compose up -d --build
+```
+
+Brings up all six containers — Postgres, Redis, Redpanda, and all three app
+services, each built from its own multi-stage `Dockerfile` — with health
+checks gating startup order (app containers wait on their real dependencies
+being healthy, not just started). Same ports as always: 8081/8082/8083.
+Rebuild after code changes with `docker compose up -d --build` again (add
+`--build` to just the changed service to skip rebuilding the others, e.g.
+`docker compose up -d --build reservation-service`).
+
+### Option B: infra in Docker, apps on the host
+
+This is the tighter dev loop (`./mvnw spring-boot:run` restarts a lot faster
+than a full image rebuild), and what most of this project was actually built
+against.
 
 ```bash
 # 1. Start Postgres + Redis + Redpanda
-docker compose up -d
+docker compose up -d postgres redis redpanda
 
 # 2. Run Event Service (port 8081)
 cd event-service
@@ -279,9 +304,17 @@ at `spring.kafka.bootstrap-servers` (default `localhost:9092`); it
 auto-creates the `seat-reserved`/`payment-confirmed`/`payment-failed` topics
 on first use, no manual provisioning needed.
 
+Don't mix the two options for the same service — a host-run
+`reservation-service` and a containerized `ticketing-reservation-service`
+both bind port 8082 and will conflict. `docker compose up -d postgres redis
+redpanda` in step 1 only starts the three infra containers, leaving the app
+containers stopped so the host-run processes own those ports.
+
+### Either way
+
 Postgres is published on host port **5433**, not 5432 — set that way in
 `docker-compose.yml` to avoid colliding with a native Postgres install. If
-`docker compose up -d` and the app still can't connect, check for a port
+services can't connect to Postgres/Redis/Redpanda, check for a port
 conflict the same way (`netstat`/`lsof` on the port in question) before
 assuming it's a code problem.
 
@@ -383,5 +416,6 @@ async inter-service communication (Kafka), a state machine for
 reserve → pay → confirm/release/expire, a scheduled sweep as the safety
 net for the failure modes events alone don't cover, and a load test that
 proves the concurrency safety claim against the real running system rather
-than asserting it in prose. See the root of this repo for the full build
-log as later services are added.
+than asserting it in prose. All 7 steps on the roadmap above are done; see
+[ARCHITECTURE.md](ARCHITECTURE.md) for the reasoning behind the design and
+an honest accounting of what's cut for scope.

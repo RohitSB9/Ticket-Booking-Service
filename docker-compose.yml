@@ -10,7 +10,9 @@ services:
       POSTGRES_PASSWORD: ticketing_pass
     ports:
       # Host port 5433: a pre-existing native Postgres service on this
-      # machine already occupies 5432.
+      # machine already occupies 5432. Containers reach this over the
+      # compose network as postgres:5432 regardless — this remap only
+      # matters for host-side tools/connections.
       - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -37,6 +39,15 @@ services:
     # Kafka-API-compatible broker, single node, plaintext, no schema registry
     # (we use plain JSON messages, not Avro) — simplest thing that speaks the
     # Kafka protocol for local dev.
+    #
+    # Two listeners, not one: the "external" one is what host-run services
+    # use (mvn spring-boot:run, this repo's usual dev loop) at
+    # localhost:9092; the "internal" one is what the containerized app
+    # services below use at redpanda:29092. A broker's advertised address is
+    # what clients get redirected to after the initial connection, so a
+    # single "advertise as localhost" listener would break for anything
+    # calling in from inside another container, where "localhost" means
+    # that container itself.
     command:
       - redpanda
       - start
@@ -46,8 +57,8 @@ services:
       - --overprovisioned
       - --node-id=0
       - --check=false
-      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
-      - --advertise-kafka-addr=PLAINTEXT://localhost:9092
+      - --kafka-addr=internal://0.0.0.0:29092,external://0.0.0.0:9092
+      - --advertise-kafka-addr=internal://redpanda:29092,external://localhost:9092
     ports:
       - "9092:9092"
     healthcheck:
@@ -55,6 +66,79 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  event-service:
+    build:
+      context: ./event-service
+    container_name: ticketing-event-service
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/ticketing
+      SPRING_DATASOURCE_USERNAME: ticketing_user
+      SPRING_DATASOURCE_PASSWORD: ticketing_pass
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8081/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  reservation-service:
+    build:
+      context: ./reservation-service
+    container_name: ticketing-reservation-service
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/ticketing
+      SPRING_DATASOURCE_USERNAME: ticketing_user
+      SPRING_DATASOURCE_PASSWORD: ticketing_pass
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: "6379"
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: redpanda:29092
+      EVENT_SERVICE_BASE_URL: http://event-service:8081
+    ports:
+      - "8082:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      event-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8082/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  payment-service:
+    build:
+      context: ./payment-service
+    container_name: ticketing-payment-service
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/ticketing
+      SPRING_DATASOURCE_USERNAME: ticketing_user
+      SPRING_DATASOURCE_PASSWORD: ticketing_pass
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: redpanda:29092
+    ports:
+      - "8083:8083"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8083/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
 volumes:
   pgdata:
