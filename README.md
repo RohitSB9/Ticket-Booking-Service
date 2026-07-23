@@ -34,7 +34,7 @@ concurrent load. Built to mirror real-world booking systems (e.g. Ticketmaster).
 - [x] Step 3: Add Redis distributed locking to Reservation Service
 - [x] Step 4: Add Kafka + Payment Service
 - [x] Step 5: Expiry sweep for abandoned reservations
-- [ ] Step 6: Load test proving no double-booking under concurrency
+- [x] Step 6: Load test proving no double-booking under concurrency
 - [ ] Step 7: Dockerize, deploy, write architecture doc
 
 ## Event Service — what it does
@@ -285,6 +285,68 @@ Postgres is published on host port **5433**, not 5432 — set that way in
 conflict the same way (`netstat`/`lsof` on the port in question) before
 assuming it's a code problem.
 
+## Load test
+
+`load-test/DoubleBookingLoadTest.java` is the actual proof step 6 asks
+for — not a unit test with mocks, a standalone program that hits the real,
+already-running Event Service and Reservation Service over HTTP. It creates
+a fresh event with 20 seats, then fires 200 truly-concurrent reservation
+requests — 10 racing for each seat — through a `CountDownLatch` start gate
+so every request is parked and released at the same instant, not just
+fired in a tight loop. No new dependencies: it's a single Java file run
+directly via JDK 21+'s single-file source execution, using virtual threads
+and the built-in `HttpClient`.
+
+```bash
+cd load-test
+java DoubleBookingLoadTest.java
+```
+
+The check that matters isn't the aggregate HTTP status counts (a bug could
+net the same totals with a different, wrong distribution) — it's counting
+**wins per seat** from the actual response bodies and asserting every seat
+lands on exactly 1, never 0 (a lost update) or 2+ (a double booking):
+
+```
+=== Per-seat outcome (source of truth: reservation-service response bodies) ===
+Seats with exactly 1 winner: 20 / 20
+
+=== Cross-check against Event Service seat state ===
+Seats RESERVED:  20 / 20
+Seats SOLD:      0 / 20 (Payment Service already confirmed these — expected, not a bug)
+Seats AVAILABLE: 0 (should be 0)
+
+PASS — every seat got exactly one winner under 200 concurrent requests. No double-booking, no lost seats.
+```
+
+(The "Seats SOLD" line exists because Payment Service is running live too
+and can confirm a reservation — flipping `RESERVED` → `SOLD` — before this
+script's cross-check GET runs. That's correct concurrent behavior, not a
+bug, which is why the pass condition checks `RESERVED + SOLD`, not
+`RESERVED` alone.)
+
+**This was verified to actually catch the bug it claims to catch** — the
+whole point of a test is being wrong when the code is wrong. Temporarily
+short-circuiting `ReservationService.createReservation`'s lock check and
+rerunning against the same 200-request burst produced real double-booking:
+
+```
+Seats with exactly 1 winner: 16 / 20
+Seats with 2+ winners (DOUBLE BOOKING): [... 4 seats, one with 5 winners ...]
+Other/errors: 12
+```
+
+Worth calling out: even with the Redis lock removed, Event Service's
+`@Version` optimistic-lock backstop (mentioned above) wasn't nothing — it
+converted some of the races into transaction failures (the 12 "Other/errors",
+`ObjectOptimisticLockingFailureException`s surfacing as 500s) instead of
+silent double-bookings. But it clearly wasn't *sufficient* on its own: 4
+seats still ended up double-booked. That's the concrete version of "defense
+in depth reduces blast radius, it doesn't replace the primary safeguard" —
+the Redis lock is what actually closes the race; the `@Version` column is
+what limits the damage on the rare path where something upstream of it
+still gets it wrong.
+
 ## Testing
 
 Integration tests spin up real Postgres, Redis, and Kafka (Testcontainers) —
@@ -318,6 +380,8 @@ cd payment-service
 Built to demonstrate distributed-systems patterns beyond basic CRUD: seat
 reservation under concurrent access, TTL-based distributed locks (Redis),
 async inter-service communication (Kafka), a state machine for
-reserve → pay → confirm/release/expire, and a scheduled sweep as the safety
-net for the failure modes events alone don't cover. See the root of this
-repo for the full build log as later services are added.
+reserve → pay → confirm/release/expire, a scheduled sweep as the safety
+net for the failure modes events alone don't cover, and a load test that
+proves the concurrency safety claim against the real running system rather
+than asserting it in prose. See the root of this repo for the full build
+log as later services are added.
