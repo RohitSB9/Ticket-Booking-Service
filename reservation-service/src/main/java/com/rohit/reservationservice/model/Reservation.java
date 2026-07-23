@@ -10,7 +10,7 @@ import java.time.Instant;
 import java.util.UUID;
 
 @Entity
-@Table(name = "reservations")
+@Table(name = "reservations", indexes = @Index(name = "idx_reservations_status_expires_at", columnList = "status, expires_at"))
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
@@ -49,6 +49,12 @@ public class Reservation {
     // into CANCELLED; null otherwise.
     @Column(name = "failure_reason")
     private String failureReason;
+
+    // How long a PENDING reservation is allowed to sit without a payment
+    // outcome before the sweep expires it. Not consulted for CONFIRMED/
+    // CANCELLED/EXPIRED reservations.
+    @Column(name = "expires_at", nullable = false)
+    private Instant expiresAt;
 
     @PreUpdate
     void onUpdate() {

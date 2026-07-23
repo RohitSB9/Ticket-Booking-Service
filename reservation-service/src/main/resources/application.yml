@@ -44,6 +44,14 @@ server:
 event-service:
   base-url: http://localhost:8081
 
+reservation:
+  # How long a PENDING reservation may sit without a payment outcome before
+  # the sweep expires it. Short here for demoability; a real system would
+  # likely use several minutes.
+  pending-ttl-seconds: 60
+  expiry-sweep:
+    fixed-delay-ms: 10000
+
 springdoc:
   swagger-ui:
     path: /swagger-ui.html

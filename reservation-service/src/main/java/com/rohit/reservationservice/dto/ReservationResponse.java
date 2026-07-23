@@ -13,7 +13,8 @@ public record ReservationResponse(
         String userId,
         ReservationStatus status,
         String failureReason,
-        Instant createdAt
+        Instant createdAt,
+        Instant expiresAt
 ) {
     public static ReservationResponse from(Reservation reservation) {
         return new ReservationResponse(
@@ -23,7 +24,8 @@ public record ReservationResponse(
                 reservation.getUserId(),
                 reservation.getStatus(),
                 reservation.getFailureReason(),
-                reservation.getCreatedAt()
+                reservation.getCreatedAt(),
+                reservation.getExpiresAt()
         );
     }
 }

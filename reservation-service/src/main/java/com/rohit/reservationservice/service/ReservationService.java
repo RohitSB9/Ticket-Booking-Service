@@ -15,22 +15,38 @@ import com.rohit.reservationservice.model.SeatStatus;
 import com.rohit.reservationservice.repository.ReservationRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class ReservationService {
 
     private final ReservationRepository reservationRepository;
     private final EventServiceClient eventServiceClient;
     private final SeatLockService seatLockService;
     private final ReservationEventPublisher reservationEventPublisher;
+    private final long pendingTtlSeconds;
+
+    public ReservationService(
+            ReservationRepository reservationRepository,
+            EventServiceClient eventServiceClient,
+            SeatLockService seatLockService,
+            ReservationEventPublisher reservationEventPublisher,
+            @Value("${reservation.pending-ttl-seconds}") long pendingTtlSeconds
+    ) {
+        this.reservationRepository = reservationRepository;
+        this.eventServiceClient = eventServiceClient;
+        this.seatLockService = seatLockService;
+        this.reservationEventPublisher = reservationEventPublisher;
+        this.pendingTtlSeconds = pendingTtlSeconds;
+    }
 
     // The Redis lock wraps the whole check-then-act against Event Service:
     // a concurrent request for the same seat now fails fast with
@@ -53,6 +69,7 @@ public class ReservationService {
                     .seatId(request.seatId())
                     .userId(request.userId())
                     .status(ReservationStatus.PENDING)
+                    .expiresAt(Instant.now().plusSeconds(pendingTtlSeconds))
                     .build();
             Reservation saved = reservationRepository.save(reservation);
 
@@ -128,6 +145,50 @@ public class ReservationService {
         try {
             reservation.setStatus(ReservationStatus.CANCELLED);
             reservation.setFailureReason(reason);
+            reservationRepository.save(reservation);
+
+            eventServiceClient.updateSeatStatus(reservation.getEventId(), reservation.getSeatId(), SeatStatus.AVAILABLE);
+        } finally {
+            seatLockService.unlock(reservation.getSeatId(), reservation.getUserId());
+        }
+    }
+
+    // Candidate list for the expiry sweep — PENDING reservations past their
+    // expiresAt. Read outside a lock; expireReservation re-checks status
+    // after acquiring the seat lock, so a candidate that got confirmed/
+    // failed/cancelled between this query and the lock acquisition is
+    // simply skipped there, not double-processed.
+    @Transactional(readOnly = true)
+    public List<UUID> findExpiredPendingReservationIds() {
+        return reservationRepository.findByStatusAndExpiresAtBefore(ReservationStatus.PENDING, Instant.now())
+                .stream()
+                .map(Reservation::getId)
+                .collect(Collectors.toList());
+    }
+
+    // Invoked by the scheduled sweep — same idempotency guard as
+    // confirmReservation/failReservation: a reservation that Payment
+    // Service resolved between the sweep's query and this call is left
+    // alone, not overwritten.
+    @Transactional
+    public void expireReservation(UUID reservationId) {
+        Reservation reservation = reservationRepository.findById(reservationId)
+                .orElseThrow(() -> new ResourceNotFoundException("Reservation not found: " + reservationId));
+
+        if (reservation.getStatus() != ReservationStatus.PENDING) {
+            log.info("Ignoring expiry sweep for reservation {} in status {} (already processed)",
+                    reservationId, reservation.getStatus());
+            return;
+        }
+
+        if (!seatLockService.tryLock(reservation.getSeatId(), reservation.getUserId())) {
+            log.info("Skipping expiry sweep for reservation {} — seat lock held by another request, will retry next sweep",
+                    reservationId);
+            return;
+        }
+        try {
+            reservation.setStatus(ReservationStatus.EXPIRED);
+            reservation.setFailureReason("Reservation expired after " + pendingTtlSeconds + "s without a payment outcome");
             reservationRepository.save(reservation);
 
             eventServiceClient.updateSeatStatus(reservation.getEventId(), reservation.getSeatId(), SeatStatus.AVAILABLE);
